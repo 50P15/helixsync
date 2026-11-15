@@ -3,15 +3,29 @@
 # Upstream only publishes linux/amd64. The source is checked out straight
 # from GhaziAlibi/helixsync at the release tag, so this fork never needs
 # syncing to build a new version.
+#
+# A scheduled run checks the latest upstream release and builds it only when
+# this account's GHCR doesn't have that version yet. A manual run always
+# builds. `latest` is only moved when the built version is the upstream
+# latest release.
+#
+# Note: GitHub disables scheduled workflows after 60 days without activity in
+# the repository; re-enable it from the Actions tab if that happens.
 name: ARM64 images
 
 on:
+  schedule:
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       version:
         description: "Upstream release to build (e.g. 1.0.21). Empty = latest release."
         required: false
         default: ""
+
+concurrency:
+  group: arm64-images
+  cancel-in-progress: false
 
 permissions: {}
 
@@ -24,32 +38,60 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       owner: ${{ steps.v.outputs.owner }}
+      build: ${{ steps.v.outputs.build }}
+      is_latest: ${{ steps.v.outputs.is_latest }}
     steps:
       - id: v
         env:
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
           OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/releases/latest" | jq -r '.tag_name')
+          latest="${latest#v}"
           version="${INPUT_VERSION#v}"
-          if [ -z "$version" ]; then
-            version=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$UPSTREAM/releases/latest" | jq -r '.tag_name')
-            version="${version#v}"
+          [ -n "$version" ] || version="$latest"
+          for v in "$version" "$latest"; do
+            if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Invalid version: $v" >&2
+              exit 1
+            fi
+          done
+
+          build=true
+          if [ "$EVENT_NAME" = schedule ]; then
+            echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin >/dev/null
+            build=false
+            for c in server web; do
+              if ! docker buildx imagetools inspect "$REGISTRY/$owner/helixsync-$c:$version" >/dev/null 2>&1; then
+                build=true
+              fi
+            done
           fi
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Invalid version: $version" >&2
-            exit 1
+
+          if [ "$build" = true ]; then
+            echo "Building $UPSTREAM v$version (upstream latest: v$latest)"
+          else
+            echo "v$version already published, nothing to do"
           fi
-          echo "Building $UPSTREAM v$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "owner=$owner"
+            echo "build=$build"
+            echo "is_latest=$([ "$version" = "$latest" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -80,7 +122,7 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner }}/helixsync-${{ matrix.component }}:${{ needs.resolve.outputs.version }}
-            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner }}/helixsync-${{ matrix.component }}:latest
+            ${{ needs.resolve.outputs.is_latest == 'true' && format('{0}/{1}/helixsync-{2}:latest', env.REGISTRY, needs.resolve.outputs.owner, matrix.component) || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
