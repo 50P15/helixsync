@@ -4,7 +4,7 @@
 # from GhaziAlibi/helixsync at the release tag, so this fork never needs
 # syncing to build a new version.
 #
-# A scheduled run checks the latest upstream release and builds it only when
+# A scheduled run checks the newest upstream version tag and builds it only when
 # this account's GHCR doesn't have that version yet. A manual run always
 # builds. `latest` is only moved when the built version is the upstream
 # latest release.
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Upstream release to build (e.g. 1.0.21). Empty = latest release."
+        description: "Upstream version tag to build (e.g. 1.0.23). Empty = newest tag."
         required: false
         default: ""
 
@@ -54,9 +54,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          # Upstream tags every version (vX.Y.Z) but only creates a GitHub
+          # release when the extension changes, so use the newest tag.
           latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$UPSTREAM/releases/latest" | jq -r '.tag_name')
-          latest="${latest#v}"
+            "https://api.github.com/repos/$UPSTREAM/tags?per_page=100" \
+            | jq -r '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
           version="${INPUT_VERSION#v}"
           [ -n "$version" ] || version="$latest"
           for v in "$version" "$latest"; do
